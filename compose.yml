@@ -1,0 +1,73 @@
+services:
+  # RRDcached service
+  rrdcached:
+    build:
+      context: .
+      dockerfile: Dockerfile.rrdcached
+    container_name: grafana-rrd-rrdcached
+    volumes:
+      - ./sample:/var/lib/rrdcached/db/sample:ro
+      - ./docker-data/rrdcached-socket:/var/run
+      - ./docker-data/rrdcached-journal:/var/lib/rrdcached/journal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-S", "/var/run/rrdcached.sock"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Grafana RRD server C (using RRDcached)
+  grafana-rrd-server-c:
+    build: .
+    container_name: grafana-rrd-server-c
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./sample:/var/lib/rrdcached/db/sample:ro
+      - ./docker-data/rrdcached-socket:/var/run
+    command: ["-r", "/var/lib/rrdcached/db/sample", "-d", "unix:/var/run/rrdcached.sock", "-p", "9000"]
+    depends_on:
+      rrdcached:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana RRD server F (direct RRD access)
+  grafana-rrd-server-f:
+    build: .
+    container_name: grafana-rrd-server-f
+    ports:
+      - "9001:9000"
+    volumes:
+      - ./sample:/var/lib/rrdcached/db/sample:ro
+      - ./docker-data/rrdcached-socket:/var/run
+    command: ["-r", "/var/lib/rrdcached/db/sample", "-p", "9000"]
+    depends_on:
+      rrdcached:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana server
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana-rrd-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./docker-data/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    restart: unless-stopped

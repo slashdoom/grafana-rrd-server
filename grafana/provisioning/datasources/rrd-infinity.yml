@@ -1,0 +1,25 @@
+apiVersion: 1
+
+datasources:
+  - name: grafana-rrd-server-c
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: "http://grafana-rrd-server-c:9000"
+    editable: true
+    jsonData:
+      auth_method: none
+      health_check_enabled: true
+      health_check_url: "/"
+    secureJsonData: {}
+    version: 1
+  - name: grafana-rrd-server-f
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: "http://grafana-rrd-server-f:9000"
+    editable: true
+    jsonData:
+      auth_method: none
+      health_check_enabled: true
+      health_check_url: "/"
+    secureJsonData: {}
+    version: 1

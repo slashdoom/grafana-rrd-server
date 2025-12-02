@@ -1,0 +1,35 @@
+FROM debian:trixie-slim
+
+# Install rrdcached and rrdtool
+# Note: rrdcached is in the rrdtool package
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    rrdcached \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Verify rrdcached is available
+RUN which rrdcached
+
+# Create necessary directories
+RUN mkdir -p /var/lib/rrdcached/db /var/lib/rrdcached/journal /var/run
+
+# Expose the default rrdcached port (optional, we use unix socket)
+EXPOSE 42217
+
+# Run rrdcached in foreground with proper options
+# -g = run in foreground
+# -F = don't fork (foreground mode for Docker)
+# -l = listen address (unix socket)
+# -b = base directory for RRD files  
+# -B = allow writes to base directory
+# -p = PID file
+# -j = journal directory for pending updates
+CMD ["rrdcached", \
+     "-g", \
+     "-F", \
+     "-l", "unix:/var/run/rrdcached.sock", \
+     "-b", "/var/lib/rrdcached/db", \
+     "-B", \
+     "-p", "/var/run/rrdcached.pid", \
+     "-j", "/var/lib/rrdcached/journal"]

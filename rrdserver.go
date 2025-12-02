@@ -1,29 +1,49 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gocarina/gocsv"
 	"github.com/mattn/go-zglob"
+	rrdcached "github.com/multiplay/go-rrd"
 	"github.com/ziutek/rrd"
 )
 
 var config Config
+var logger *slog.Logger
+var rrdcachedClient *rrdcached.Client
+
+func init() {
+	// Initialize logger with a default handler for tests
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		}))
+	}
+}
 
 type QueryResponse struct {
 	Target     string      `json:"target"`
 	DataPoints [][]float64 `json:"datapoints"`
+}
+
+type LsResponse struct {
+	Directories []string `json:"directories"`
+	Files       []string `json:"files"`
 }
 
 type SearchRequest struct {
@@ -101,6 +121,7 @@ type ServerConfig struct {
 	Port               int
 	AnnotationFilePath string
 	Multiplier         int
+	RrdCached          string
 }
 
 type ErrorResponse struct {
@@ -126,7 +147,7 @@ func (w *SearchCache) Get() []string {
 func (w *SearchCache) Update() {
 	newItems := []string{}
 
-	fmt.Println("Updating search cache.")
+	logger.Info("Updating search cache")
 	err := filepath.Walk(strings.TrimRight(config.Server.RrdPath, "/")+"/",
 		func(path string, info os.FileInfo, err error) error {
 			if err != nil {
@@ -140,12 +161,35 @@ func (w *SearchCache) Update() {
 			fName := strings.Replace(rel, ".rrd", "", 1)
 			fName = strings.Replace(fName, "/", ":", -1)
 
-			infoRes, err := rrd.Info(path)
-			if err != nil {
-				fmt.Println("ERROR: Cannot retrieve information from ", path)
-				fmt.Println(err)
+			// Use rrdcached if configured, otherwise direct file access
+			var dsIndex map[string]interface{}
+
+			if rrdcachedClient != nil {
+				// Use rrdcached client
+				infoRes, err := rrdcachedClient.Info(path)
+				if err != nil {
+					logger.Error("Cannot retrieve information from RRD via rrdcached", "path", path, "error", err)
+					return nil
+				}
+				// Parse ds.index from rrdcached Info response
+				dsIndex = make(map[string]interface{})
+				for _, info := range infoRes {
+					if strings.HasPrefix(info.Key, "ds[") && strings.HasSuffix(info.Key, "].index") {
+						dsName := strings.TrimSuffix(strings.TrimPrefix(info.Key, "ds["), "].index")
+						dsIndex[dsName] = info.Value
+					}
+				}
+			} else {
+				// Use direct file access
+				infoRes, err := rrd.Info(path)
+				if err != nil {
+					logger.Error("Cannot retrieve information from RRD file", "path", path, "error", err)
+					return nil
+				}
+				dsIndex = infoRes["ds.index"].(map[string]interface{})
 			}
-			for ds, _ := range infoRes["ds.index"].(map[string]interface{}) {
+
+			for ds := range dsIndex {
 				newItems = append(newItems, fName+":"+ds)
 			}
 
@@ -153,23 +197,73 @@ func (w *SearchCache) Update() {
 		})
 
 	if err != nil {
-		fmt.Printf("Error walking path: %s\n", err)
+		logger.Error("Error walking path", "error", err)
 		return
 	}
 
 	w.m.Lock()
 	defer w.m.Unlock()
 	w.items = newItems
-	fmt.Println("Finished updating search cache.")
+	logger.Info("Finished updating search cache", "items", len(newItems))
 }
 
 var searchCache *SearchCache = NewSearchCache()
 
+// fetchRRDData fetches data from RRD file, using rrdcached if configured
+func fetchRRDData(filePath, cf string, start, end time.Time, step time.Duration) ([][]float64, []string, time.Time, time.Duration, int, error) {
+	if rrdcachedClient != nil {
+		// Use rrdcached client
+		// Calculate options for fetch
+		startUnix := start.Unix()
+		endUnix := end.Unix()
+
+		fetch, err := rrdcachedClient.Fetch(filePath, cf, startUnix, endUnix)
+		if err != nil {
+			return nil, nil, time.Time{}, 0, 0, err
+		}
+
+		// Convert multiplay fetch result to our format
+		points := make([][]float64, len(fetch.Rows))
+		for i, row := range fetch.Rows {
+			points[i] = make([]float64, len(row.Data))
+			for j, val := range row.Data {
+				if val != nil {
+					points[i][j] = *val
+				} else {
+					points[i][j] = math.NaN()
+				}
+			}
+		}
+
+		return points, fetch.Names, fetch.Start, fetch.Step, len(fetch.Rows), nil
+	} else {
+		// Use direct file access with ziutek/rrd
+		fetchRes, err := rrd.Fetch(filePath, cf, start, end, step)
+		if err != nil {
+			return nil, nil, time.Time{}, 0, 0, err
+		}
+
+		// Convert ziutek result to our format
+		dsCount := len(fetchRes.DsNames)
+		points := make([][]float64, fetchRes.RowCnt)
+		for i := 0; i < fetchRes.RowCnt; i++ {
+			points[i] = make([]float64, dsCount)
+			for j := 0; j < dsCount; j++ {
+				points[i][j] = fetchRes.ValueAt(j, i)
+			}
+		}
+		defer fetchRes.FreeValues()
+
+		return points, fetchRes.DsNames, fetchRes.Start, fetchRes.Step, fetchRes.RowCnt, nil
+	}
+}
+
 func respondJSON(w http.ResponseWriter, result interface{}) {
 	json, err := json.Marshal(result)
 	if err != nil {
-		fmt.Println("ERROR: Cannot convert response data into JSON")
-		fmt.Println(err)
+		logger.Error("Cannot convert response data into JSON", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -183,13 +277,91 @@ func hello(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, result)
 }
 
+func ls(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "accept, content-type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS")
+		w.Write(nil)
+		return
+	}
+
+	var searchRequest SearchRequest
+	if r.Body != nil {
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&searchRequest)
+		if err != nil && err.Error() != "EOF" {
+			logger.Error("Cannot decode ls request", "error", err)
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+	}
+
+	target := searchRequest.Target
+	prefix := target
+	if prefix != "" {
+		prefix = prefix + ":"
+	}
+
+	// Track directories and files at this level
+	dirSet := make(map[string]bool)
+	fileSet := make(map[string]bool)
+
+	for _, path := range searchCache.Get() {
+		// Remove datasource (everything after last colon)
+		lastColon := strings.LastIndex(path, ":")
+		if lastColon <= 0 {
+			continue
+		}
+		filePath := path[:lastColon]
+
+		// Check if this path is under our target directory
+		if !strings.HasPrefix(filePath, prefix) {
+			continue
+		}
+
+		// Get the relative path from the target
+		relPath := strings.TrimPrefix(filePath, prefix)
+
+		// If there's a colon, it's a subdirectory
+		if strings.Contains(relPath, ":") {
+			// Extract first directory component
+			parts := strings.SplitN(relPath, ":", 2)
+			dirSet[parts[0]] = true
+		} else if relPath != "" {
+			// It's a file at this level
+			fileSet[relPath] = true
+		}
+	}
+
+	// Convert to slices
+	directories := make([]string, 0, len(dirSet))
+	for dir := range dirSet {
+		directories = append(directories, dir)
+	}
+
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+
+	result := LsResponse{
+		Directories: directories,
+		Files:       files,
+	}
+
+	respondJSON(w, result)
+}
+
 func search(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	var searchRequest SearchRequest
 	err := decoder.Decode(&searchRequest)
 	if err != nil {
-		fmt.Println("ERROR: Cannot decode the request")
-		fmt.Println(err)
+		logger.Error("Cannot decode search request", "error", err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
 	}
 	defer r.Body.Close()
 
@@ -220,8 +392,9 @@ func query(w http.ResponseWriter, r *http.Request) {
 	var queryRequest QueryRequest
 	err := decoder.Decode(&queryRequest)
 	if err != nil {
-		fmt.Println("ERROR: Cannot decode the request")
-		fmt.Println(err)
+		logger.Error("Cannot decode query request", "error", err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
 	}
 	defer r.Body.Close()
 
@@ -239,36 +412,78 @@ func query(w http.ResponseWriter, r *http.Request) {
 		for _, filePath := range fileNameArray {
 			points := make([][]float64, 0)
 			if _, err = os.Stat(filePath); err != nil {
-				fmt.Println("File", filePath, "does not exist")
+				logger.Warn("File does not exist", "path", filePath)
 				continue
 			}
-			infoRes, err := rrd.Info(filePath)
-			if err != nil {
-				fmt.Println("ERROR: Cannot retrieve information from ", filePath)
-				fmt.Println(err)
+
+			// Get info using appropriate method
+			var lastUpdate time.Time
+			var dsIndex int
+
+			if rrdcachedClient != nil {
+				// Use rrdcached client for Info
+				infoRes, err := rrdcachedClient.Info(filePath)
+				if err != nil {
+					logger.Error("Cannot retrieve information from RRD via rrdcached", "path", filePath, "error", err)
+					continue
+				}
+				// Parse last_update and ds.index from rrdcached Info response
+				for _, info := range infoRes {
+					if info.Key == "last_update" {
+						if val, ok := info.Value.(int64); ok {
+							lastUpdate = time.Unix(val, 0)
+						}
+					}
+					if strings.HasPrefix(info.Key, "ds["+ds+"].index") {
+						if val, ok := info.Value.(int64); ok {
+							dsIndex = int(val)
+						}
+					}
+				}
+			} else {
+				// Use direct file access for Info
+				infoRes, err := rrd.Info(filePath)
+				if err != nil {
+					logger.Error("Cannot retrieve information from RRD file", "path", filePath, "error", err)
+					continue
+				}
+				lastUpdate = time.Unix(int64(infoRes["last_update"].(uint)), 0)
+				dsIndex = int(infoRes["ds.index"].(map[string]interface{})[ds].(uint))
 			}
-			lastUpdate := time.Unix(int64(infoRes["last_update"].(uint)), 0)
+
 			if to.After(lastUpdate) && lastUpdate.After(from) {
 				to = lastUpdate
 			}
-			fetchRes, err := rrd.Fetch(filePath, "AVERAGE", from, to, time.Duration(config.Server.Step)*time.Second)
+
+			fetchData, dsNames, fetchStart, fetchStep, rowCnt, err := fetchRRDData(filePath, "AVERAGE", from, to, time.Duration(config.Server.Step)*time.Second)
 			if err != nil {
-				fmt.Println("ERROR: Cannot retrieve time series data from ", filePath)
-				fmt.Println(err)
+				logger.Error("Cannot retrieve time series data from RRD file", "path", filePath, "error", err)
+				continue
 			}
-			timestamp := fetchRes.Start
-			dsIndex := int(infoRes["ds.index"].(map[string]interface{})[ds].(uint))
-			// The last point is likely to contain wrong data (mostly a big number)
-			// RowCnt-1 is for ignoring the last point (temporary solution)
-			for i := 0; i < fetchRes.RowCnt-1; i++ {
-				value := fetchRes.ValueAt(dsIndex, i)
-				if !math.IsNaN(value) {
-					product := float64(config.Server.Multiplier) * value
-					points = append(points, []float64{product, float64(timestamp.Unix()) * 1000})
+
+			// Find dsIndex if we don't have it yet (rrdcached path)
+			if rrdcachedClient != nil && dsIndex == 0 {
+				for i, name := range dsNames {
+					if name == ds {
+						dsIndex = i
+						break
+					}
 				}
-				timestamp = timestamp.Add(fetchRes.Step)
 			}
-			defer fetchRes.FreeValues()
+
+			timestamp := fetchStart
+			// The last point is likely to contain wrong data (mostly a big number)
+			// rowCnt-1 is for ignoring the last point (temporary solution)
+			for i := 0; i < rowCnt-1; i++ {
+				if dsIndex < len(fetchData[i]) {
+					value := fetchData[i][dsIndex]
+					if !math.IsNaN(value) {
+						product := float64(config.Server.Multiplier) * value
+						points = append(points, []float64{product, float64(timestamp.Unix()) * 1000})
+					}
+				}
+				timestamp = timestamp.Add(fetchStep)
+			}
 
 			extractedTarget := strings.Replace(filePath, ".rrd", "", -1)
 			extractedTarget = strings.Replace(extractedTarget, config.Server.RrdPath, "", -1)
@@ -297,20 +512,19 @@ func annotations(w http.ResponseWriter, r *http.Request) {
 		err := decoder.Decode(&annotationRequest)
 		defer r.Body.Close()
 		if err != nil {
+			logger.Error("Cannot decode annotation request", "error", err)
 			result := ErrorResponse{Message: "Cannot decode the request"}
 			respondJSON(w, result)
 		} else {
 			csvFile, err := os.OpenFile(config.Server.AnnotationFilePath, os.O_RDONLY, os.ModePerm)
 			if err != nil {
-				fmt.Println("ERROR: Cannot open the annotations CSV file ", config.Server.AnnotationFilePath)
-				fmt.Println(err)
+				logger.Error("Cannot open annotations CSV file", "path", config.Server.AnnotationFilePath, "error", err)
 			}
 			defer csvFile.Close()
 			annots := []*AnnotationCSV{}
 
 			if err := gocsv.UnmarshalFile(csvFile, &annots); err != nil {
-				fmt.Println("ERROR: Cannot unmarshal the annotations CSV file.")
-				fmt.Println(err)
+				logger.Error("Cannot unmarshal annotations CSV file", "error", err)
 			}
 
 			result := []AnnotationResponse{}
@@ -334,17 +548,54 @@ func SetArgs() {
 	flag.Int64Var(&config.Server.SearchCache, "c", 600, "Search cache in seconds.")
 	flag.StringVar(&config.Server.AnnotationFilePath, "a", "", "Path for a file that has annotations.")
 	flag.IntVar(&config.Server.Multiplier, "m", 1, "Value multiplier.")
+	flag.StringVar(&config.Server.RrdCached, "d", "", "RRDCached daemon address (e.g., unix:/var/run/rrdcached.sock or localhost:42217).")
 	flag.Parse()
 }
 
 func main() {
 	SetArgs()
 
+	// Initialize structured logger
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	logAttrs := []any{
+		"port", config.Server.Port,
+		"rrdPath", config.Server.RrdPath,
+		"step", config.Server.Step,
+	}
+
+	// Initialize rrdcached client if configured
+	if config.Server.RrdCached != "" {
+		var err error
+		// Determine if Unix socket or TCP
+		if strings.HasPrefix(config.Server.RrdCached, "unix:") {
+			socketPath := strings.TrimPrefix(config.Server.RrdCached, "unix:")
+			rrdcachedClient, err = rrdcached.NewClient(socketPath, rrdcached.Unix)
+		} else {
+			rrdcachedClient, err = rrdcached.NewClient(config.Server.RrdCached)
+		}
+		if err != nil {
+			logger.Error("Failed to connect to rrdcached, falling back to direct file access",
+				"daemon", config.Server.RrdCached, "error", err)
+			rrdcachedClient = nil
+		} else {
+			logAttrs = append(logAttrs, "rrdcached", config.Server.RrdCached)
+			logger.Info("Connected to rrdcached successfully", "daemon", config.Server.RrdCached)
+			defer rrdcachedClient.Close()
+		}
+	}
+
+	logger.Info("Starting Grafana RRD Server", logAttrs...)
+
+	http.HandleFunc("/ls", ls)
 	http.HandleFunc("/search", search)
 	http.HandleFunc("/query", query)
 	http.HandleFunc("/annotations", annotations)
 	http.HandleFunc("/", hello)
 
+	// Start search cache updater
 	go func() {
 		for {
 			searchCache.Update()
@@ -352,9 +603,38 @@ func main() {
 		}
 	}()
 
-	err := http.ListenAndServe(config.Server.IpAddr+":"+strconv.Itoa(config.Server.Port), nil)
-	if err != nil {
-		fmt.Println("ERROR:", err)
+	// Create HTTP server with timeouts
+	server := &http.Server{
+		Addr:         config.Server.IpAddr + ":" + strconv.Itoa(config.Server.Port),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start server in a goroutine
+	go func() {
+		logger.Info("Server listening", "address", server.Addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("Server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for interrupt signal to gracefully shutdown the server
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	logger.Info("Shutting down server...")
+
+	// Give outstanding requests 30 seconds to complete
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("Server forced to shutdown", "error", err)
 		os.Exit(1)
 	}
+
+	logger.Info("Server exited gracefully")
 }
