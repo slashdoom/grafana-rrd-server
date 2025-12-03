@@ -26,6 +26,7 @@ import (
 var config Config
 var logger *slog.Logger
 var rrdcachedClient *rrdcached.Client
+var rrdcachedMutex sync.Mutex
 
 func init() {
 	// Initialize logger with a default handler for tests
@@ -209,15 +210,75 @@ func (w *SearchCache) Update() {
 
 var searchCache *SearchCache = NewSearchCache()
 
+// recreateRRDCachedClient recreates the rrdcached client connection
+func recreateRRDCachedClient() error {
+	rrdcachedMutex.Lock()
+	defer rrdcachedMutex.Unlock()
+
+	if rrdcachedClient != nil {
+		rrdcachedClient.Close()
+		rrdcachedClient = nil
+	}
+
+	var err error
+	if strings.HasPrefix(config.Server.RrdCached, "unix:") {
+		socketPath := strings.TrimPrefix(config.Server.RrdCached, "unix:")
+		rrdcachedClient, err = rrdcached.NewClient(socketPath, rrdcached.Unix)
+	} else {
+		rrdcachedClient, err = rrdcached.NewClient(config.Server.RrdCached)
+	}
+
+	if err != nil {
+		logger.Error("Failed to reconnect to rrdcached", "daemon", config.Server.RrdCached, "error", err)
+		return err
+	}
+
+	logger.Info("Reconnected to rrdcached", "daemon", config.Server.RrdCached)
+	return nil
+}
+
 // fetchRRDData fetches data from RRD file, using rrdcached if configured
 func fetchRRDData(filePath, cf string, start, end time.Time, step time.Duration) ([][]float64, []string, time.Time, time.Duration, int, error) {
 	if rrdcachedClient != nil {
-		// Use rrdcached client
-		// Calculate options for fetch
+		// Use rrdcached client with retry logic
 		startUnix := start.Unix()
 		endUnix := end.Unix()
 
-		fetch, err := rrdcachedClient.Fetch(filePath, cf, startUnix, endUnix)
+		// Flush the file first to ensure we get latest data
+		// This is important when WRITE_TIMEOUT is high
+		flushErr := rrdcachedClient.Flush(filePath)
+		if flushErr != nil {
+			logger.Warn("Failed to flush RRD file before fetch", "path", filePath, "error", flushErr)
+		}
+
+		var err error
+		var fetch *rrdcached.Fetch
+
+		// Retry up to 3 times with exponential backoff
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				logger.Warn("Retrying rrdcached fetch", "attempt", attempt+1, "backoff", backoff, "path", filePath)
+				time.Sleep(backoff)
+			}
+
+			fetch, err = rrdcachedClient.Fetch(filePath, cf, startUnix, endUnix)
+			if err == nil {
+				break
+			}
+
+			logger.Error("RRDCached fetch failed", "path", filePath, "attempt", attempt+1, "error", err)
+
+			// If timeout or connection error, try recreating the connection
+			if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "connection") {
+				logger.Warn("Recreating rrdcached connection due to timeout")
+				if recreateErr := recreateRRDCachedClient(); recreateErr == nil {
+					// Successfully reconnected, continue to next retry
+					continue
+				}
+			}
+		}
+
 		if err != nil {
 			return nil, nil, time.Time{}, 0, 0, err
 		}
@@ -604,11 +665,12 @@ func main() {
 	}()
 
 	// Create HTTP server with timeouts
+	// Longer timeouts to accommodate slow rrdcached responses
 	server := &http.Server{
 		Addr:         config.Server.IpAddr + ":" + strconv.Itoa(config.Server.Port),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Start server in a goroutine
